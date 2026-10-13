@@ -1,0 +1,127 @@
+name: Build & Push Images
+
+# Build image Docker untuk backend, cms, dan web dari repo masing-masing,
+# lalu push ke GitHub Container Registry (ghcr.io/<owner>/ponpes-<service>).
+#
+# Trigger:
+#   - Manual  : tab Actions → "Build & Push Images" → Run workflow
+#   - Dari repo aplikasi (repository_dispatch):
+#       curl -X POST -H "Authorization: Bearer <PAT>" \
+#         https://api.github.com/repos/<owner>/ponpes-mardhotullah-infrastructure/dispatches \
+#         -d '{"event_type":"build","client_payload":{"service":"backend","ref":"main"}}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Service yang di-build
+        type: choice
+        options: [all, backend, cms, web]
+        default: all
+      ref:
+        description: Branch/tag/SHA di repo aplikasi (kosong = default branch repo tsb)
+        type: string
+        default: ''
+  repository_dispatch:
+    types: [build]
+
+concurrency:
+  group: build-${{ github.event.inputs.service || github.event.client_payload.service || 'all' }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  SERVICE: ${{ github.event.inputs.service || github.event.client_payload.service || 'all' }}
+  REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || '' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        run: |
+          all='[
+            {"service":"backend","repo":"ponpes-mardhotullah-backend"},
+            {"service":"cms","repo":"ponpes-mardhotullah-cms"},
+            {"service":"web","repo":"ponpes-mardhotullah-web"}
+          ]'
+          case "$SERVICE" in
+            all|backend|cms|web) ;;
+            *) echo "::error::service tidak dikenal: $SERVICE"; exit 1 ;;
+          esac
+          matrix=$(echo "$all" | jq -c --arg s "$SERVICE" '[.[] | select($s == "all" or .service == $s)]')
+          echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Validasi variables
+        if: matrix.service != 'backend'
+        env:
+          PUBLIC_API: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+        run: |
+          if [ -z "$PUBLIC_API" ]; then
+            echo "::error::Repository variable NEXT_PUBLIC_API_BASE_URL belum diset (Settings → Secrets and variables → Actions → Variables)"
+            exit 1
+          fi
+
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ matrix.repo }}
+          ref: ${{ env.REF }}
+          # PAT (fine-grained, Contents: read) untuk repo aplikasi yang private
+          token: ${{ secrets.REPO_TOKEN || github.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ponpes-${{ matrix.service }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable=${{ env.REF == '' }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          # Hanya dipakai cms & web (NEXT_PUBLIC_* di-bake saat build); backend mengabaikannya.
+          build-args: |
+            API_BASE_URL=${{ vars.API_BASE_URL || 'http://backend:8080/api' }}
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL }}
+            NEXT_PUBLIC_LOGIN_URL=${{ vars.NEXT_PUBLIC_LOGIN_URL }}
+            NEXT_PUBLIC_PPDB_URL=${{ vars.NEXT_PUBLIC_PPDB_URL }}
+            NEXT_PUBLIC_WHATSAPP_NUMBER=${{ vars.NEXT_PUBLIC_WHATSAPP_NUMBER }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### ponpes-${{ matrix.service }}"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

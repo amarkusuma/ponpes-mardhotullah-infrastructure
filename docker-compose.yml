@@ -1,0 +1,89 @@
+# Stack production Ponpes Mardhotullah.
+# Image dibuild oleh workflow .github/workflows/build-images.yml.
+#
+#   cp .env.example .env   # isi nilainya
+#   docker compose pull && docker compose up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60 1", "--loglevel", "warning"]
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      - '127.0.0.1:9001:9001' # console, akses lewat SSH tunnel
+
+  backend:
+    image: ghcr.io/${GHCR_OWNER}/ponpes-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ''
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-6h}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-168h}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ponpes}
+      MINIO_USE_SSL: 'false'
+    ports:
+      - '${BACKEND_PORT:-8080}:8080'
+
+  cms:
+    image: ghcr.io/${GHCR_OWNER}/ponpes-cms:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on: [backend]
+    environment:
+      API_BASE_URL: http://backend:8080/api
+    ports:
+      - '${CMS_PORT:-3000}:3000'
+
+  web:
+    image: ghcr.io/${GHCR_OWNER}/ponpes-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on: [backend]
+    environment:
+      API_BASE_URL: http://backend:8080/api
+    ports:
+      - '${WEB_PORT:-3001}:3000'
+
+volumes:
+  postgres_data: {}
+  redis_data: {}
+  minio_data: {}
