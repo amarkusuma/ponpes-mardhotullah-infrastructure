@@ -75,6 +75,11 @@ jobs:
               echo "ERROR: network traefik_public tidak ada. Jalankan stack NuSewa dulu."
               exit 1
             fi
+            # MinIO tidak di-pull (pull_policy: never), harus sudah ada di host.
+            if ! docker image inspect minio/minio:latest >/dev/null 2>&1; then
+              echo "ERROR: image minio/minio:latest tidak ada di VPS (registry MinIO butuh login, tidak bisa di-pull)."
+              exit 1
+            fi
             if [ ! -f .env ]; then
               echo "ERROR: $WORK_DIR/.env belum ada (cp .env.example .env lalu isi)."
               exit 1

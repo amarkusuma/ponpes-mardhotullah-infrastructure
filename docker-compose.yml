@@ -46,8 +46,12 @@ services:
       - redis_data:/data
     networks: [internal]
 
+  # Registry MinIO (Docker Hub minio/minio & quay.io) sekarang menolak pull tanpa login.
+  # Pakai image yang sudah ada di VPS (dipakai juga oleh nusewa_minio) dan jangan pull.
+  # Kalau image belum ada di host: `docker save` dari mesin lain lalu `docker load`.
   ponpes-minio:
-    image: quay.io/minio/minio:latest
+    image: minio/minio:latest
+    pull_policy: never
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
