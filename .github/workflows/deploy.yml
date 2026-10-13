@@ -1,0 +1,118 @@
+name: Deploy Ponpes
+
+# Deploy stack ponpes ke VPS (yang sama dengan NuSewa) via SSH:
+# git pull repo infrastructure → docker compose pull → up -d → cek health backend.
+#
+# Trigger:
+#   - Manual  : tab Actions → "Deploy Ponpes" → Run workflow
+#   - Otomatis: dari "Build & Push Images" dengan input deploy = true
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Tag image yang di-deploy (latest atau SHA pendek dari hasil build)
+        type: string
+        default: latest
+  workflow_call:
+    inputs:
+      image_tag:
+        type: string
+        default: latest
+
+concurrency:
+  group: deploy-ponpes
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Production VPS
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
+          WORK_DIR: ${{ secrets.DEPLOY_WORK_DIR }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          envs: IMAGE_TAG,WORK_DIR,GHCR_USER,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -eu
+
+            echo "=== Deploy Ponpes (IMAGE_TAG=$IMAGE_TAG) ==="
+
+            echo "=== Pre-check ==="
+            # WORK_DIR harus folder clone repo infrastructure ponpes (berisi .git,
+            # docker-compose.yml, .env). `cd ""` tidak error di bash, jadi cek eksplisit.
+            if [ -z "$WORK_DIR" ] || [ ! -d "$WORK_DIR" ]; then
+              echo "ERROR: secret DEPLOY_WORK_DIR kosong atau folder '$WORK_DIR' tidak ada."
+              exit 1
+            fi
+            cd "$WORK_DIR"
+            if [ ! -d .git ] || [ ! -f docker-compose.yml ]; then
+              echo "ERROR: '$WORK_DIR' bukan clone repo infrastructure (tidak ada .git / docker-compose.yml)."
+              exit 1
+            fi
+            if ! grep -q '^name: ponpes$' docker-compose.yml; then
+              echo "ERROR: docker-compose.yml di '$WORK_DIR' bukan milik stack ponpes (salah folder? NuSewa?)."
+              exit 1
+            fi
+            branch=$(git rev-parse --abbrev-ref HEAD)
+            if [ "$branch" != "main" ]; then
+              echo "ERROR: repo di '$WORK_DIR' sedang di branch '$branch', harus 'main'."
+              exit 1
+            fi
+            # Stack ini menumpang Traefik NuSewa; tanpa network ini compose gagal start.
+            if ! docker network inspect traefik_public >/dev/null 2>&1; then
+              echo "ERROR: network traefik_public tidak ada. Jalankan stack NuSewa dulu."
+              exit 1
+            fi
+            if [ ! -f .env ]; then
+              echo "ERROR: $WORK_DIR/.env belum ada (cp .env.example .env lalu isi)."
+              exit 1
+            fi
+            if grep -q '^[A-Z].*ganti-' .env; then
+              echo "ERROR: .env masih berisi placeholder 'ganti-*'."
+              exit 1
+            fi
+
+            echo "=== Update infrastructure repository ==="
+            git pull --ff-only origin main
+
+            if [ -n "$GHCR_TOKEN" ]; then
+              echo "=== Login GHCR ==="
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            echo "=== Pull images ==="
+            export IMAGE_TAG
+            docker compose pull
+
+            echo "=== Start services ==="
+            # --remove-orphans hanya berlaku untuk project "ponpes"; stack NuSewa tidak tersentuh.
+            docker compose up -d --remove-orphans
+
+            echo "=== Health check backend ==="
+            ok=""
+            for i in $(seq 1 30); do
+              if docker compose exec -T ponpes-backend wget -qO- http://localhost:8080/health >/dev/null 2>&1; then
+                ok=1; break
+              fi
+              sleep 2
+            done
+            docker compose ps
+            if [ -z "$ok" ]; then
+              echo "ERROR: backend tidak sehat setelah 60 detik. Log terakhir:"
+              docker compose logs --tail 50 ponpes-backend
+              exit 1
+            fi
+
+            echo "=== Deploy completed ==="

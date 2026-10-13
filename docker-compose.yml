@@ -1,43 +1,29 @@
 # Stack production Ponpes Mardhotullah.
 # Image dibuild oleh workflow .github/workflows/build-images.yml.
 #
+# Stack ini TIDAK menjalankan Traefik sendiri: ia menumpang Traefik milik stack
+# NuSewa (nusewa_traefik, port 80/443) lewat network eksternal `traefik_public`.
+# Stack NuSewa harus sudah jalan lebih dulu.
+#
 #   cp .env.example .env   # isi nilainya
 #   docker compose pull && docker compose up -d
 #
-# Routing (Traefik, HTTPS otomatis via Let's Encrypt):
-#   https://${DOMAIN}          → web
+# Routing (HTTPS otomatis via certresolver `letsencrypt` milik Traefik NuSewa):
+#   https://${DOMAIN}          → ponpes-web
 #   https://www.${DOMAIN}      → redirect ke https://${DOMAIN}
-#   https://cms.${DOMAIN}      → cms
-#   https://api.${DOMAIN}      → backend
+#   https://cms.${DOMAIN}      → ponpes-cms
+#   https://api.${DOMAIN}      → ponpes-backend
+#
+# Aturan supaya tidak bentrok dengan NuSewa (satu Traefik & satu network bersama):
+#   - Nama service diberi prefix `ponpes-`: service di traefik_public saling bisa
+#     resolve by name, dan NuSewa sudah memakai `backend`, `cms`, `web`, `minio`.
+#   - Nama router/service/middleware Traefik juga diberi prefix `ponpes-`:
+#     nama yang sama di dua stack membuat Traefik menonaktifkan keduanya.
+
+name: ponpes
 
 services:
-  traefik:
-    image: traefik:v3.6
-    restart: unless-stopped
-    command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=ponpes_proxy
-      - --entrypoints.web.address=:80
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --entrypoints.websecure.address=:443
-      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
-      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-      - --log.level=INFO
-      - --accesslog=true
-    ports:
-      - '80:80'
-      - '443:443'
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - letsencrypt:/letsencrypt
-    networks: [proxy]
-
-  postgres:
+  ponpes-postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -52,7 +38,7 @@ services:
       retries: 5
     networks: [internal]
 
-  redis:
+  ponpes-redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--save", "60 1", "--loglevel", "warning"]
@@ -60,7 +46,7 @@ services:
       - redis_data:/data
     networks: [internal]
 
-  minio:
+  ponpes-minio:
     image: quay.io/minio/minio:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -69,78 +55,97 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 5
     ports:
-      - '127.0.0.1:9001:9001' # console, akses lewat SSH tunnel
+      - '127.0.0.1:9011:9001' # console, akses lewat SSH tunnel
     networks: [internal]
 
-  backend:
+  # Kalau DB/MinIO belum siap saat start, backend exit (fatal) lalu di-restart
+  # otomatis oleh `restart: unless-stopped` sampai koneksinya berhasil.
+  ponpes-backend:
     image: ghcr.io/${GHCR_OWNER}/ponpes-backend:${IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
-      postgres:
+      ponpes-postgres:
         condition: service_healthy
-      redis:
+      ponpes-redis:
         condition: service_started
-      minio:
-        condition: service_started
+      ponpes-minio:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
-      REDIS_ADDR: redis:6379
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@ponpes-postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_ADDR: ponpes-redis:6379
       REDIS_PASSWORD: ''
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      ALLOWED_ORIGINS: https://${DOMAIN},https://cms.${DOMAIN}
+      ALLOWED_ORIGINS: https://${DOMAIN},https://www.${DOMAIN},https://cms.${DOMAIN}
       ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-6h}
       REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-168h}
-      MINIO_ENDPOINT: minio:9000
+      MINIO_ENDPOINT: ponpes-minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-ponpes}
       MINIO_USE_SSL: 'false'
     labels:
       - traefik.enable=true
-      - traefik.http.routers.backend.rule=Host(`api.${DOMAIN}`)
-      - traefik.http.routers.backend.entrypoints=websecure
-      - traefik.http.services.backend.loadbalancer.server.port=8080
-    networks: [internal, proxy]
+      - traefik.docker.network=traefik_public
+      - traefik.http.routers.ponpes-api.rule=Host(`api.${DOMAIN}`)
+      - traefik.http.routers.ponpes-api.entrypoints=websecure
+      - traefik.http.routers.ponpes-api.tls.certresolver=letsencrypt
+      - traefik.http.routers.ponpes-api.service=ponpes-api
+      - traefik.http.services.ponpes-api.loadbalancer.server.port=8080
+    networks: [internal, traefik_public]
 
-  cms:
+  ponpes-cms:
     image: ghcr.io/${GHCR_OWNER}/ponpes-cms:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    depends_on: [backend]
+    depends_on: [ponpes-backend]
     environment:
-      API_BASE_URL: http://backend:8080/api
+      API_BASE_URL: http://ponpes-backend:8080/api
     labels:
       - traefik.enable=true
-      - traefik.http.routers.cms.rule=Host(`cms.${DOMAIN}`)
-      - traefik.http.routers.cms.entrypoints=websecure
-      - traefik.http.services.cms.loadbalancer.server.port=3000
-    networks: [internal, proxy]
+      - traefik.docker.network=traefik_public
+      - traefik.http.routers.ponpes-cms.rule=Host(`cms.${DOMAIN}`)
+      - traefik.http.routers.ponpes-cms.entrypoints=websecure
+      - traefik.http.routers.ponpes-cms.tls.certresolver=letsencrypt
+      - traefik.http.routers.ponpes-cms.service=ponpes-cms
+      - traefik.http.services.ponpes-cms.loadbalancer.server.port=3000
+    networks: [internal, traefik_public]
 
-  web:
+  ponpes-web:
     image: ghcr.io/${GHCR_OWNER}/ponpes-web:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    depends_on: [backend]
+    depends_on: [ponpes-backend]
     environment:
-      API_BASE_URL: http://backend:8080/api
+      API_BASE_URL: http://ponpes-backend:8080/api
     labels:
       - traefik.enable=true
-      - traefik.http.routers.web.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)
-      - traefik.http.routers.web.entrypoints=websecure
-      - traefik.http.routers.web.middlewares=www-to-apex
-      - traefik.http.middlewares.www-to-apex.redirectregex.regex=^https://www\.(.+)
-      - traefik.http.middlewares.www-to-apex.redirectregex.replacement=https://$${1}
-      - traefik.http.middlewares.www-to-apex.redirectregex.permanent=true
-      - traefik.http.services.web.loadbalancer.server.port=3000
-    networks: [internal, proxy]
+      - traefik.docker.network=traefik_public
+      - traefik.http.routers.ponpes-web.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)
+      - traefik.http.routers.ponpes-web.entrypoints=websecure
+      - traefik.http.routers.ponpes-web.tls.certresolver=letsencrypt
+      - traefik.http.routers.ponpes-web.service=ponpes-web
+      - traefik.http.routers.ponpes-web.middlewares=ponpes-www-redirect
+      - traefik.http.middlewares.ponpes-www-redirect.redirectregex.regex=^https://www\.(.+)
+      - traefik.http.middlewares.ponpes-www-redirect.redirectregex.replacement=https://$${1}
+      - traefik.http.middlewares.ponpes-www-redirect.redirectregex.permanent=true
+      - traefik.http.services.ponpes-web.loadbalancer.server.port=3000
+    networks: [internal, traefik_public]
 
 networks:
-  internal: {}
-  proxy:
-    name: ponpes_proxy
+  internal:
+    name: ponpes_internal
+  # Dibuat oleh stack NuSewa (nusewa-infrastructure)
+  traefik_public:
+    external: true
 
 volumes:
-  postgres_data: {}
-  redis_data: {}
-  minio_data: {}
-  letsencrypt: {}
+  postgres_data:
+    name: ponpes_postgres_data
+  redis_data:
+    name: ponpes_redis_data
+  minio_data:
+    name: ponpes_minio_data

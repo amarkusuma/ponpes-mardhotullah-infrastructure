@@ -5,6 +5,7 @@ name: Build & Push Images
 #
 # Trigger:
 #   - Manual  : tab Actions → "Build & Push Images" → Run workflow
+#               (centang "deploy" untuk langsung deploy ke VPS setelah build)
 #   - Dari repo aplikasi (repository_dispatch):
 #       curl -X POST -H "Authorization: Bearer <PAT>" \
 #         https://api.github.com/repos/<owner>/ponpes-mardhotullah-infrastructure/dispatches \
@@ -19,9 +20,13 @@ on:
         options: [all, backend, cms, web]
         default: all
       ref:
-        description: Branch/tag/SHA di repo aplikasi (kosong = default branch repo tsb)
+        description: Branch/tag/SHA di repo aplikasi (kosong/main/master = default branch masing-masing repo)
         type: string
         default: ''
+      deploy:
+        description: Deploy ke VPS setelah build sukses (hanya untuk build default branch)
+        type: boolean
+        default: false
   repository_dispatch:
     types: [build]
 
@@ -42,10 +47,11 @@ jobs:
     steps:
       - id: matrix
         run: |
+          # branch = default branch tiap repo (web memakai master)
           all='[
-            {"service":"backend","repo":"ponpes-mardhotullah-backend"},
-            {"service":"cms","repo":"ponpes-mardhotullah-cms"},
-            {"service":"web","repo":"ponpes-mardhotullah-web"}
+            {"service":"backend","repo":"ponpes-mardhotullah-backend","branch":"main"},
+            {"service":"cms","repo":"ponpes-mardhotullah-cms","branch":"main"},
+            {"service":"web","repo":"ponpes-mardhotullah-web","branch":"master"}
           ]'
           case "$SERVICE" in
             all|backend|cms|web) ;;
@@ -64,11 +70,25 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
-      - name: Checkout ${{ matrix.repo }}
+      # REF kosong/main/master = "default branch" → diterjemahkan ke branch tiap repo,
+      # supaya `service: all` + `ref: main` tidak gagal di repo web (master).
+      # Ref lain (branch fitur, tag, SHA) dipakai apa adanya.
+      - id: ref
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          case "$REF" in
+            ''|main|master) ref="$BRANCH" ;;
+            *) ref="$REF" ;;
+          esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "is_default=$([ "$ref" = "$BRANCH" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout ${{ matrix.repo }}@${{ steps.ref.outputs.ref }}
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/${{ matrix.repo }}
-          ref: ${{ env.REF }}
+          ref: ${{ steps.ref.outputs.ref }}
           # PAT (fine-grained, Contents: read) untuk repo aplikasi yang private
           token: ${{ secrets.REPO_TOKEN || github.token }}
 
@@ -84,9 +104,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ponpes-${{ matrix.service }}
+          # latest hanya untuk build dari default branch repo tsb
           tags: |
             type=sha,prefix=,format=short
-            type=raw,value=latest,enable=${{ env.REF == '' }}
+            type=raw,value=latest,enable=${{ steps.ref.outputs.is_default }}
 
       # Hanya variable yang diisi yang dikirim sebagai build-arg; sisanya pakai default di Dockerfile
       # (domain mardhotullah.com). NEXT_PUBLIC_* di-bake saat build → ganti nilai = build ulang.
@@ -121,8 +142,20 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### ponpes-${{ matrix.service }}"
+            echo "### ponpes-${{ matrix.service }} (${{ matrix.repo }}@${{ steps.ref.outputs.ref }})"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Deploy tag `latest`, jadi hanya masuk akal untuk build dari default branch
+  # (ref lain tidak memperbarui `latest`).
+  deploy:
+    needs: build
+    if: >-
+      github.event.inputs.deploy == 'true' &&
+      (github.event.inputs.ref == '' || github.event.inputs.ref == 'main' || github.event.inputs.ref == 'master')
+    uses: ./.github/workflows/deploy.yml
+    with:
+      image_tag: latest
+    secrets: inherit
