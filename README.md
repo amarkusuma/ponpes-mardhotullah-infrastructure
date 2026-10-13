@@ -25,16 +25,18 @@ dan opsional `ref` (branch/tag/SHA).
 |---|---|
 | `REPO_TOKEN` | Fine-grained PAT dengan akses **Contents: Read** ke 3 repo aplikasi. Wajib kalau repo aplikasi private. |
 
-**Variables** (tab Variables). Nilai `NEXT_PUBLIC_*` di-bake ke image saat build, jadi ganti nilai = build ulang.
+**Variables** (opsional, tab Variables). Default-nya sudah untuk `mardhotullah.com`;
+isi hanya kalau ingin mengganti. Nilai ini di-bake ke image web saat build, jadi ganti nilai = build ulang.
 
-| Nama | Contoh | Dipakai |
-|---|---|---|
-| `NEXT_PUBLIC_API_BASE_URL` | `https://api.example.com/api` | cms, web (wajib) |
-| `API_BASE_URL` | `http://backend:8080/api` | cms, web (rewrite `/uploads`, `/api/publik`) |
-| `NEXT_PUBLIC_APP_URL` | `https://example.com` | web |
-| `NEXT_PUBLIC_LOGIN_URL` | `https://cms.example.com/login` | web |
-| `NEXT_PUBLIC_PPDB_URL` | | web |
-| `NEXT_PUBLIC_WHATSAPP_NUMBER` | `628xxxx` | web |
+| Nama | Default |
+|---|---|
+| `NEXT_PUBLIC_APP_URL` | `https://mardhotullah.com` |
+| `NEXT_PUBLIC_LOGIN_URL` | `https://cms.mardhotullah.com/login` |
+| `NEXT_PUBLIC_PPDB_URL` | (kosong) |
+| `NEXT_PUBLIC_WHATSAPP_NUMBER` | (kosong) |
+
+CMS dan web memanggil backend lewat proxy di domainnya sendiri (`/api/backend` dan `/api/publik`),
+jadi tidak perlu konfigurasi URL API.
 
 ### Trigger dari repo aplikasi (opsional)
 
@@ -45,14 +47,26 @@ curl -X POST \
   -d '{"event_type":"build","client_payload":{"service":"backend","ref":"main"}}'
 ```
 
-## Deploy dengan Docker Compose
+## Deploy dengan Docker Compose + Traefik
+
+| URL | Service |
+|---|---|
+| https://mardhotullah.com | web (`www.` di-redirect ke sini) |
+| https://cms.mardhotullah.com | cms |
+| https://api.mardhotullah.com | backend |
+
+Traefik menangani HTTPS otomatis (Let's Encrypt, HTTP challenge) dan redirect HTTP → HTTPS.
+
+1. Arahkan DNS **A record** `mardhotullah.com`, `www`, `cms`, `api` ke IP server.
+2. Buka port **80** dan **443** di firewall server.
+3. Jalankan:
 
 ```bash
-cp .env.example .env        # isi password & secret
+cp .env.example .env        # isi password, secret, ACME_EMAIL
 echo <PAT read:packages> | docker login ghcr.io -u <owner> --password-stdin   # jika package private
 docker compose pull
 docker compose up -d
 ```
 
 Backend menjalankan migrasi & seeder otomatis saat start. Bucket MinIO dibuat otomatis.
-Pasang reverse proxy (Nginx/Caddy) + TLS di depan port backend, cms, dan web.
+Console MinIO hanya listen di `127.0.0.1:9001` server — akses lewat `ssh -L 9001:localhost:9001 <server>`.

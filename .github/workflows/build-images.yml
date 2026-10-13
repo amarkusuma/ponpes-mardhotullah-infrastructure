@@ -64,16 +64,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
-      - name: Validasi variables
-        if: matrix.service != 'backend'
-        env:
-          PUBLIC_API: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
-        run: |
-          if [ -z "$PUBLIC_API" ]; then
-            echo "::error::Repository variable NEXT_PUBLIC_API_BASE_URL belum diset (Settings → Secrets and variables → Actions → Variables)"
-            exit 1
-          fi
-
       - name: Checkout ${{ matrix.repo }}
         uses: actions/checkout@v4
         with:
@@ -98,6 +88,24 @@ jobs:
             type=sha,prefix=,format=short
             type=raw,value=latest,enable=${{ env.REF == '' }}
 
+      # Hanya variable yang diisi yang dikirim sebagai build-arg; sisanya pakai default di Dockerfile
+      # (domain mardhotullah.com). NEXT_PUBLIC_* di-bake saat build → ganti nilai = build ulang.
+      - id: args
+        if: matrix.service == 'web'
+        env:
+          NEXT_PUBLIC_APP_URL: ${{ vars.NEXT_PUBLIC_APP_URL }}
+          NEXT_PUBLIC_LOGIN_URL: ${{ vars.NEXT_PUBLIC_LOGIN_URL }}
+          NEXT_PUBLIC_PPDB_URL: ${{ vars.NEXT_PUBLIC_PPDB_URL }}
+          NEXT_PUBLIC_WHATSAPP_NUMBER: ${{ vars.NEXT_PUBLIC_WHATSAPP_NUMBER }}
+        run: |
+          {
+            echo 'list<<EOF'
+            for k in NEXT_PUBLIC_APP_URL NEXT_PUBLIC_LOGIN_URL NEXT_PUBLIC_PPDB_URL NEXT_PUBLIC_WHATSAPP_NUMBER; do
+              [ -n "${!k}" ] && echo "$k=${!k}"
+            done
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
@@ -108,14 +116,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,scope=${{ matrix.service }},mode=max
-          # Hanya dipakai cms & web (NEXT_PUBLIC_* di-bake saat build); backend mengabaikannya.
-          build-args: |
-            API_BASE_URL=${{ vars.API_BASE_URL || 'http://backend:8080/api' }}
-            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
-            NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL }}
-            NEXT_PUBLIC_LOGIN_URL=${{ vars.NEXT_PUBLIC_LOGIN_URL }}
-            NEXT_PUBLIC_PPDB_URL=${{ vars.NEXT_PUBLIC_PPDB_URL }}
-            NEXT_PUBLIC_WHATSAPP_NUMBER=${{ vars.NEXT_PUBLIC_WHATSAPP_NUMBER }}
+          build-args: ${{ steps.args.outputs.list }}
 
       - name: Summary
         run: |
