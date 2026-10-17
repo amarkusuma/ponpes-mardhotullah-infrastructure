@@ -80,6 +80,8 @@ services:
       ponpes-minio:
         condition: service_healthy
     environment:
+      # production: seeder hanya membuat permission/role (+ admin awal), tanpa data dummy
+      APP_ENV: production
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@ponpes-postgres:5432/${POSTGRES_DB}?sslmode=disable
       REDIS_ADDR: ponpes-redis:6379
       REDIS_PASSWORD: ''
@@ -93,6 +95,9 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-ponpes}
       MINIO_USE_SSL: 'false'
+      ADMIN_NAME: ${ADMIN_NAME:-Administrator}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     labels:
       - traefik.enable=true
       - traefik.docker.network=traefik_public
